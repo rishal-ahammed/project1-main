@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { Event, EventContextType, User } from '../types';
-import { sampleEvents } from '../data/sampleData';
+import { supabase } from '../lib/supabase';
 
 const EventContext = createContext<EventContextType | undefined>(undefined);
 
@@ -14,42 +14,96 @@ export const useEvents = () => {
 };
 
 export const EventProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [events, setEvents] = useState<Event[]>(() => {
-    const storedEvents = localStorage.getItem('events');
-    return storedEvents ? JSON.parse(storedEvents) : sampleEvents;
-  });
+  const [events, setEvents] = useState<Event[]>([]);
+  const [registrations, setRegistrations] = useState<User[]>([]);
   
-  const [registrations, setRegistrations] = useState<User[]>(() => {
-    const storedRegistrations = localStorage.getItem('registrations');
-    return storedRegistrations ? JSON.parse(storedRegistrations) : [];
-  });
-  
-  // Save to localStorage whenever state changes
+  // Fetch events on mount
   useEffect(() => {
-    localStorage.setItem('events', JSON.stringify(events));
-  }, [events]);
+    fetchEvents();
+    fetchRegistrations();
+  }, []);
   
-  useEffect(() => {
-    localStorage.setItem('registrations', JSON.stringify(registrations));
-  }, [registrations]);
-  
-  const addEvent = (event: Omit<Event, 'id' | 'registrationCount' | 'createdAt'>) => {
-    const newEvent: Event = {
-      ...event,
-      id: uuidv4(),
-      registrationCount: 0,
-      createdAt: new Date(),
-    };
-    setEvents([...events, newEvent]);
+  const fetchEvents = async () => {
+    const { data, error } = await supabase
+      .from('events')
+      .select('*')
+      .order('created_at', { ascending: false });
+      
+    if (error) {
+      console.error('Error fetching events:', error);
+      return;
+    }
+    
+    setEvents(data || []);
   };
   
-  const updateEvent = (updatedEvent: Event) => {
+  const fetchRegistrations = async () => {
+    const { data, error } = await supabase
+      .from('registrations')
+      .select('*')
+      .order('created_at', { ascending: false });
+      
+    if (error) {
+      console.error('Error fetching registrations:', error);
+      return;
+    }
+    
+    setRegistrations(data || []);
+  };
+  
+  const addEvent = async (event: Omit<Event, 'id' | 'registrationCount' | 'createdAt'>) => {
+    const { data, error } = await supabase
+      .from('events')
+      .insert([{
+        ...event,
+        registration_count: 0,
+      }])
+      .select()
+      .single();
+    
+    if (error) {
+      console.error('Error adding event:', error);
+      return;
+    }
+    
+    setEvents([data, ...events]);
+  };
+  
+  const updateEvent = async (updatedEvent: Event) => {
+    const { error } = await supabase
+      .from('events')
+      .update({
+        title: updatedEvent.title,
+        description: updatedEvent.description,
+        date: updatedEvent.date,
+        location: updatedEvent.location,
+        capacity: updatedEvent.capacity,
+        registration_count: updatedEvent.registrationCount,
+        image_url: updatedEvent.imageUrl,
+      })
+      .eq('id', updatedEvent.id);
+    
+    if (error) {
+      console.error('Error updating event:', error);
+      return;
+    }
+    
     setEvents(events.map(event => 
       event.id === updatedEvent.id ? updatedEvent : event
     ));
   };
   
-  const removeEvent = (id: string) => {
+  const removeEvent = async (id: string) => {
+    const { error } = await supabase
+      .from('events')
+      .delete()
+      .eq('id', id);
+    
+    if (error) {
+      console.error('Error removing event:', error);
+      return;
+    }
+    
     setEvents(events.filter(event => event.id !== id));
     setRegistrations(registrations.filter(reg => reg.eventId !== id));
   };
@@ -58,7 +112,7 @@ export const EventProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return events.find(event => event.id === id);
   };
   
-  const registerUser = (userData: Omit<User, 'id' | 'registrationDate'>) => {
+  const registerUser = async (userData: Omit<User, 'id' | 'registrationDate'>) => {
     const eventId = userData.eventId;
     const event = getEvent(eventId);
     
@@ -68,22 +122,41 @@ export const EventProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const { available } = getAvailableSpots(eventId);
     if (available <= 0) return false;
     
-    // Create new user registration
-    const newUser: User = {
-      ...userData,
-      id: uuidv4(),
-      registrationDate: new Date(),
-    };
+    // Create new registration
+    const { data: registration, error: registrationError } = await supabase
+      .from('registrations')
+      .insert([{
+        event_id: eventId,
+        name: userData.name,
+        phone: userData.phone,
+        location: userData.location,
+      }])
+      .select()
+      .single();
     
-    // Update registrations
-    setRegistrations([...registrations, newUser]);
+    if (registrationError) {
+      console.error('Error creating registration:', registrationError);
+      return false;
+    }
     
     // Update event registration count
-    const updatedEvent = {
-      ...event,
-      registrationCount: event.registrationCount + 1,
-    };
-    updateEvent(updatedEvent);
+    const { error: updateError } = await supabase
+      .from('events')
+      .update({ registration_count: event.registrationCount + 1 })
+      .eq('id', eventId);
+    
+    if (updateError) {
+      console.error('Error updating event count:', updateError);
+      return false;
+    }
+    
+    // Update local state
+    setRegistrations([...registrations, registration]);
+    setEvents(events.map(e => 
+      e.id === eventId 
+        ? { ...e, registrationCount: e.registrationCount + 1 }
+        : e
+    ));
     
     return true;
   };
@@ -92,7 +165,17 @@ export const EventProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return registrations.filter(user => user.eventId === eventId);
   };
   
-  const setEventCapacity = (eventId: string, capacity: number) => {
+  const setEventCapacity = async (eventId: string, capacity: number) => {
+    const { error } = await supabase
+      .from('events')
+      .update({ capacity })
+      .eq('id', eventId);
+    
+    if (error) {
+      console.error('Error updating capacity:', error);
+      return;
+    }
+    
     setEvents(events.map(event => 
       event.id === eventId ? { ...event, capacity } : event
     ));
